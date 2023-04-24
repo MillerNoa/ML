@@ -1,0 +1,1399 @@
+---
+title: "Prediction of electromagnetic shower particles "
+author: 'Noa Miller'
+date: "January 18 2023"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+geometry: "left=1.25cm,right=1.25cm,top=1.25cm,bottom=1.25cm"
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE, echo = FALSE, warning=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      message = FALSE, 
+                      warning = FALSE,
+                      include = FALSE)
+```
+
+```{r}
+library(readr)
+library(png)
+library(e1071)
+library(rpart)
+library(tree)
+library(randomForest)
+library(dplyr)
+library(tidyverse)
+library(MASS)
+library(lattice)
+library(ggplot2)
+library(InformationValue) 
+library(ROCR)
+library(plotROC)
+library(caret)
+library(pROC)
+library(patchwork)
+library(mvtnorm)
+library(MVN)
+library(ellipse)
+library(rgl)
+library(threejs)
+library(corrplot)
+library(patchwork)
+library(mlr)
+library(ggcorrplot)
+library(xgboost)
+library(tensorflow)
+library(torchvision)
+library(torch)
+library(keras)
+```
+
+
+```{r}
+# REFERENCES
+# https://cran.r-project.org/web/packages/caret/vignettes/caret.html
+# https://www.geeksforgeeks.org/cross-validation-in-r-programming/
+# An Introduction to Statistical Learning, Gareth James,Daniela Witten,Trevor Hastie,Robert Tibshirani
+# https://stackoverflow.com/questions/37438461/ggplot2-use-of-scale-x-reverse-on-roc-plot
+# http://r-statistics.co/Information-Value-With-R.html
+# https://towardsdatascience.com/linear-discriminant-analysis-lda-101-using-r-6a97217a55a6
+# http://r-statistics.co/Information-Value-With-R.html
+# https://mlr-org.com/posts/2015-07-28-visualisation-of-predictions/
+# https://www.statology.org/roc-curve-ggplot2/
+# https://medium.datadriveninvestor.com/understanding-the-log-loss-function-of-xgboost-8842e99d975d
+# https://towardsdatascience.com/when-and-why-tree-based-models-often-outperform-neural-networks-ceba9ecd0fd8
+# https://stackoverflow.com/questions/37897252/plot-confusion-matrix-in-r-using-ggplot
+```
+
+```{r}
+# loading the data and checking missing values
+# omitting NA data from the set, and loading the data
+gamma <- na.omit(read_csv("data/gamma.csv")) 
+gamma.proba <- na.omit(read_csv("data/gamma_test.csv"))
+#View(gamma)
+nrow(gamma)
+which(is.na(gamma)) 
+glimpse(gamma)
+```
+
+# Introduction 
+The gamma data is extracted from MAGIC Gamma Telescope (https://archive.ics.uci.edu/ml/datasets/magic+gamma+telescope) and contains simulated data with ten variables of electromagnetic variation, as well as a categorical "class" variable. It indicates whether an observation belongs to gamma (g) or hadron (h) particles.
+The objective of this analysis is to distinguish the class variable as successfully as possible for unseen data, predict the test accuracy, and explain why that specific method works best for the gamma data.
+First of all an exploratory analysis was done, where the magnitude of the independent variables and their covariance matrices were taken into account. The variables are on a very different scale (their unit measures are different too), e.g. distance or length are very dominant in value. Since some models (e.g. Neural Networks) are particularly sensitive to heterogeneity in terms of magnitude, the data got standardized.
+After that, an analysis was done to see whether classes are linearly separable. As part of this exploration missing data was excluded, some features were plotted in 2D, and the covariance matrices by class were analysed. In terms of the variance matrices by class, there are quite some differences, however the covariance of many variables,i.e. Size vs Conc, or Size vs Distance are very similar. We expect the decision boundaries to be quadratic, hence methods beyond linearity to perform better on the data.
+
+```{r}
+plot1 <- ggplot(gamma, aes(x=Length, y=Width, col=class))+
+  geom_point(alpha=0.1)+
+  ggtitle("Plots by class")
+  
+plot2 <- ggplot(gamma, aes(x=Conc, y=Asym, col=class))+
+  geom_point(alpha=0.1)+
+  theme(legend.position = "none")
+
+plot3 <- ggplot(gamma, aes(x=M3Trans, y=Alpha, col=class))+
+  geom_point(alpha=0.1)+
+  theme(legend.position = "none")
+
+plot4 <- ggplot(gamma, aes(x=M3Long, y=Conc1, col=class))+
+  geom_point(alpha=0.1)+
+  theme(legend.position = "none")
+
+plot1 | plot2 | plot3 | plot4
+ggsave("linearity4.png")
+```
+
+
+```{r}
+summary(gamma)
+
+cor(gamma[,1:10])
+# correlation split by class - for QDA vs LDA
+round(cov(gamma%>%filter(class=="g")%>%dplyr::select(-class)),2)
+round(cov(gamma%>%filter(class=="h")%>%dplyr::select(-class)),2)
+
+# the covariance matrices by group are quite different.
+# Hence we wouldn't expect LDA to perform particularly well on the data, but rather QDA
+# The decision boundaries will be quadratic
+library(corrplot)
+library(ggcorrplot)
+
+png("cov_g.png")
+plot.new()
+corrplot(round(cov(gamma%>%filter(class=="g")%>%dplyr::select(-class)),2), method="circle", is.corr=FALSE, title="Covariance gamma", type="lower", add=TRUE, tl.srt=60)
+dev.off()
+
+ggcorrplot(round(cov(gamma%>%filter(class=="g")%>%dplyr::select(-class)),2), title="Covariance gamma", type="lower")
+ggsave("cov_g.png")
+
+
+ggcorrplot(round(cov(gamma%>%filter(class=="h")%>%dplyr::select(-class)),2), title="Covariance hadron", type="lower")
+ggsave("cov_h.png")
+
+```
+
+
+```{r}
+# the variables are on different scale. E.g. distance is very dominant in the data
+# Since some models (e.g. NN) sensitive to magnitude of the variables, we scale the data frame
+
+colMeans(gamma[,1:10])
+apply(gamma[,3:10],2,sd) # the std deviations vary significantly
+apply(gamma[,3:10],2,mean) # Dist dominates, various means
+
+# Scaling the data
+gamma <- gamma%>%mutate_at(c(colnames(gamma[,1:10])), ~(scale(.) %>% as.vector))
+apply(gamma[,3:10],2,sd) # st.dev check after scaling
+apply(gamma[,3:10],2,mean) # mean check after scaling
+attach(gamma)
+```
+
+# Logistic regression
+Logistic regression returns an accuracy of 0.7984596 at a threshold of 0.5 and the area under the curve (AUC) is 86.3% when plotting a ROC curve (specificity against sensibility). Although we could optimize this benchmark to fine-tune our prediction on either gamma or hadrons. However, the data is well balanced and this would eventually lead to a trade off: increasing prediction accuracy on one class will ultimately reduce accuracy on the other.
+As expected, the Logistic Regression model does not perform very well on the gamma data. By 10-fold cross-validation on the training set we get an accuracy of 0.779, by using the whole data for 10-fold CV 0.7757. The prediction accuracy on the test set is 0.7581. Even if it fares much better than a random guess (which would mean an AUC 50%),it is still a modest result.
+
+```{r}
+set.seed(17)
+index <- sample(2,nrow(gamma),replace=TRUE, prob=c(0.8,0.2))
+gamma.train <- gamma[index==1,]
+gamma.test <- gamma[index==2,]
+nrow(gamma.train)
+nrow(gamma.test)
+
+gamma.train.copy <- gamma.train
+gamma.test.copy <- gamma.test
+# fitting the glm model Log Reg
+gamma.train.lr <- glm(as.factor(class)~., data=gamma.train, family=binomial) 
+
+# fitted model predicting on the test data:
+gamma.test.prob <- predict(gamma.train.lr, gamma.test, type="response")
+# setting the default benchmark to P=0.5
+gamma.test.pred <- ifelse(gamma.test.prob>0.5,"h","g") #setting the threshold at 0.5
+cm.05 <- table(gamma.test$class, gamma.test.pred)
+cm.05
+
+TrueClass <- factor(c("gamma", "gamma", "hadron", "hadron"))
+PredictedClass <- factor(c("gamma", "hadron", "gamma", "hadron"))
+Y      <- c(cm.05[2], cm.05[1], cm.05[4], cm.05[3])
+df <- data.frame(TrueClass, PredictedClass, Y)
+
+ggplot(data =  df, mapping = aes(x = TrueClass, y = PredictedClass)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(size=8,aes(label = sprintf("%1.0f", Y)), vjust = 1, col="white", fontface="bold") +
+  scale_fill_gradient(low = "blue", high = "red") +
+  theme_bw() + theme(legend.position = "none")+
+ggtitle("Confusion matrix Log. Regression")
+ggsave("cm_logreg.png")
+
+# the test set is balanced (just like the whole gamma set) with around 0.5 and 0.5 share of "g" vs "h"
+# the model predicts g somewhat better than h, with a threshold of 0.5
+
+# test accuracy:
+misclass.05 <- (sum(colSums(cm.05)) - sum(diag(cm.05)))/sum(colSums(cm.05))
+misclass.05 # 0.2238979 misclassification rate on the test set
+accuracy.05 <- sum(diag(cm.05))/sum(colSums(cm.05))
+accuracy.05 # 0.7984596 the proportion of observations correctly classified at cutoff 0.5
+
+tp.05 <- sum(diag(cm.05))/sum(colSums(cm.05)) # 0.7761021
+fn.05 <- 1 - tp.05 # 0.2238979
+
+actuals <- gamma.test$class == "h"
+sens <- caret::sensitivity(table(gamma.test$class, gamma.test.pred)) # 0.7433414
+spec <- caret::specificity(table(gamma.test$class, gamma.test.pred)) # 0.8606557
+```
+
+
+```{r}
+roc = roc(predictor = gamma.test$class,
+          response = gamma.test.prob,
+          levels = c('g','h'),
+          percent = TRUE)
+
+gamma.test.pred.07 <- ifelse(gamma.test.prob>0.7,"h","g")
+sens.07 <-caret::sensitivity(table(gamma.test$class, gamma.test.pred.07)) # 0.5407407
+spec.07 <-caret::specificity(table(gamma.test$class, gamma.test.pred.07)) # 0.9276808
+
+gamma.test.pred.03 <- ifelse(gamma.test.prob>0.3,"h","g")
+sens.03 <-caret::sensitivity(table(gamma.test$class, gamma.test.pred.03)) # 0.7654321
+spec.03 <-caret::specificity(table(gamma.test$class, gamma.test.pred.03)) # 0.7381546
+
+plot.roc(roc, print.auc = TRUE, col='red',
+         main="ROC curve Log Reg")
+  abline( v=c(spec*100, spec.07*100),
+         h=c(sens*100, sens.07*100),
+         col=c("purple", "green"))
+  text(75,78, "at 0.5", col="purple")
+  text(75,60, "at 0.7", col="green")
+
+roc = pROC::roc(predictor = lda.posteriors[,2],
+  response = gamma.test$class,
+  levels = c('g','h'),
+  percent = TRUE)
+#-------------------------
+
+roc.logreg <- roc(response = gamma.test$class,
+                 predictor= gamma.test.prob)
+auc.logreg <- round(auc(roc.lda),4)
+
+ggroc(list(roc.logreg),
+      aes=c("linetype", "colour"))+
+  scale_linetype_manual(values="solid",
+                        labels="logreg train")+
+  ggtitle("Test ROC Log. Regression")+
+  theme(legend.position = "bottom")+
+  annotate("text", x = .5, y = .4, label = paste('AUC test= ', round(auc.logreg,3)), size=4, col="red")
+ggsave("roc_curve_logreg.png")
+```
+
+
+```{r}
+# from MAS614007 lab notes
+preds <- ROCR::prediction(gamma.test.prob, gamma.test$class) # creating a performance 
+perf.rate <- ROCR::performance(preds, "tpr", "fpr" ) # predictor evaluations
+perf.auc <- ROCR::performance(preds, "auc" )
+perf.auc@y.values[[1]] # 0.8648668 AUC
+
+par(pty="m",mai=c(0.5,0.8,0.2,0.5), cex.lab=1.2, cex.main=1.5) # for the graphical parameters
+plot(perf.rate, lwd=2,  box.lwd=0.01,  xaxis.lwd=2.5, yaxis.lwd=2.5,
+     avg="threshold",
+     spread.estimate="boxplot",
+     colorize = T,
+     main="ROC curve Log Reg"
+     )
+abline(a=0, b=1, col="grey65", lwd=2, lty=5)
+text(x=0.4, y=.6,labels= paste0('AUC = ',round(perf.auc@y.values[[1]],3)))
+```
+
+```{r}
+# setting the default benchmark to P=0.7
+gamma.test.pred <- ifelse(gamma.test.prob>0.7,"h","g") #setting the threshold at 0.5
+cm <- table(gamma.test$class, gamma.test.pred)
+cm
+
+# test accuracy:
+misclass.07 <- (sum(colSums(cm)) - sum(diag(cm)))/sum(colSums(cm))
+misclass.07 # 0.2308725 misclassification rate on the test set  vs 0.2238979 at 0.5
+
+accuracy.07 <- sum(diag(cm))/sum(colSums(cm))
+accuracy.07 # 0.7691275 accuracy rate on the gamma.test vs 0.7761021 with 0.5
+ 
+tp.07 <- sum(diag(cm))/sum(colSums(cm)) # 0.7691275 vs 0.7761021 at 0.5
+fn.07 <- 1 - tp.05 # 0.2107383 vs 0.2238979 at 0.5
+
+precision.07 <- sum(diag(cm)) / (sum(diag(cm)) + sum(colSums(cm))-sum(diag(cm))) # accuracy
+
+tp.07 <- ifelse(gamma.test.pred == "g" & gamma.test$class == "g", 1,0)
+fn.07 <- ifelse(gamma.test.pred == "h" & gamma.test$class == "g", 1,0)
+fp.07 <- ifelse(gamma.test.pred == "g" & gamma.test$class == "h", 1,0)
+tn.07 <- ifelse(gamma.test.pred == "h" & gamma.test$class == "h" ,1,0)
+
+
+df <- data.frame(Specificity=roc$specificities, Sensitivity=roc$sensitivities)
+
+ggplot(df, aes(x = Specificity, y = Sensitivity))+ 
+  geom_path(colour = 'red', size = 1)+
+  scale_x_reverse() +
+  geom_abline(intercept = 100, slope = 1, color='grey')+
+  annotate("text", x = 30, y = 20, label = paste0('AUC: ', round(roc$auc,1), '%'), size = 8)+
+  ylab('Sensitivity (%)')+
+  xlab('Specificity (%)')+
+  geom_vline(xintercept=c(spec.07*100, spec*100),
+             linetype="dotted", col=c("steelblue", "purple"), size=1)+
+  geom_hline(yintercept=c(sens.07*100, sens*100),
+             linetype="dotted", col=c("steelblue", "purple"), size=1)+
+  annotate("text", x= spec.07*100, y=sens.07*100, label = "0.7", col="steelblue", hjust=1.5, vjust=1)+
+  annotate("text", x= spec*100, y=sens*100, label = "0.5", col="purple", hjust=-1.1, vjust=-.5)+
+  ggtitle("ROC Log. Regression with threshold 0.5 and .07")+
+  scale_y_continuous(expand = c(0, 0))
+
+ggsave("logreg_auc.png")
+```
+
+# Linear (LDA) and Quadratic (QDA) Discriminant Analysis
+
+LDA assumes that the features are normally distributed and have similar covariance matrices, then we can expect linear boundary, otherwise a quadratic method will work better on the data. But the variance matrices are not similar, and a formal multivariate normality test (mvn test "royston") rejects normality for all variables. If the distribution of the predictors were approximately normal in each class, and the sample size relatively small, then LDA would work better than Logistic Regression. 
+Despite the below QQ-Plots we assume normality as per the CLT (Central Limit Theorem), and for this sample size LDA indeed seems to have a somewhat better prediction accuracy than Logistic Regression with 0.78819.
+
+When plotting the first three principal components we find that despite dimensionality reduction, the two classes are not well separated - there is no main variables splitting the data. 
+
+And even though the covariances are somewhat different, QDA is not performing very well either. The sample size is still relatively small (only about 2,000 observations each), and the 10-fold cross validated mean accuracy is 0.7447205 with a test accuracy of 0.7265 (the lowest up to this point).
+
+
+```{r}
+# EDA with PCA
+gamma.pca <- princomp(gamma[,1:10], cor=T)
+summary(gamma.pca)
+predict(gamma.pca)
+plot(gamma.pca)
+
+gam <- as.data.frame(predict(gamma.pca))
+gam$class <- gamma$class
+
+pc1_2 <- ggplot(gam[,1:2], aes(x=gam[,1] , 
+                      y=gam[,2], col=as.factor(class)))+
+  labs(fill="Quality",x="PC1 42.37%", y="PC2 14.97%", colour="Quality")+
+  geom_point(alpha=0.1)+
+  ggtitle("plot of PC1, PC2")
+
+# the first principal component stores 42% of the variation in the data.
+# Group h tends to have a significant subset having higher PC1 and PC2 values. However, the most part
+# of the data is still jumbled up and not easily separable by these two components.
+
+pc1_3 <- ggplot(gam[,1:3], aes(x=gam[,1] , 
+                      y=gam[,3], col=as.factor(class)))+
+  labs(fill="Quality",x="PC1 42.37%", y="PC3 10.44%", colour="Quality")+
+  geom_point(alpha=0.1)+
+  ggtitle("plot of PC1, PC3")
+
+pc2_3 <- ggplot(gam[,2:3], aes(x=gam[,2], 
+                      y=gam[,3], col=as.factor(class)))+
+  labs(fill="Quality",x="PC2 14.97%", y="PC3 10.44%", colour="Quality")+
+  geom_point(alpha=0.1)+
+  ggtitle("plot of PC2, PC3")
+
+pc1_2 + pc2_3 + pc1_3
+# the data is not well separable by the first three principal components
+# the best distinction is provided by PC1, PC2 (by definition), however still significant overlap
+# between the two groups. This indicates a weak relationship between the variables/ no high variation.
+round(cor(gamma%>%filter(class=="g")%>%dplyr::select(-class)),2)
+round(cor(gamma%>%filter(class=="h")%>%dplyr::select(-class)),2)
+```
+
+
+```{r}
+# QDA, checking for multivariate normality via Q-Q - plot by class:
+gamma.train.lm.g <- lm(class~., data=gamma.train%>%dplyr::filter(class=="g")) 
+gamma.train.lm.h <- lm(as.factor(class)~., data=gamma.train[gamma.train['class']=="h",]) 
+
+g <- gamma%>%dplyr::filter(class=="g")
+h <- gamma%>%dplyr::filter(class=="h")
+
+# checking normality for "g", "h"
+
+par(mfrow=c(5,2))
+for (i in 1:ncol(g[,1: ncol(g) - 1 ])){
+qqnorm(g[[i]], main = names(g[i]))
+   qqline(g[, i]) # Alpha not fully normal
+}
+
+#checking normality for "h"
+par(mfrow=c(5,2))
+qqplot_h <- for (i in 1:ncol(h[,1: ncol(h) - 1 ])){
+qqnorm(h[[i]], main = names(h[i]))
+   qqline(h[, i]) # Alpha, Width, M3Trans not fully normal
+}
+
+par(mfrow=c(2,5))
+qqplot_all <- for (i in 1:ncol(gamma[,1: ncol(gamma) - 1 ])){
+qqnorm(gamma[[i]], main = names(gamma[i]))
+   qqline(gamma[, i]) # Alpha, Width, M3Trans not fully normal
+}
+
+qqplot_g <- readPNG("qqplot_g.png")
+qqplot_h <- readPNG("qqplot_h.png")
+qqplot_all <- readPNG("qqplot_all.png")
+
+```
+
+
+```{r}
+# https://medium.com/mlearning-ai/drawing-and-plotting-observations-from-a-multivariate-normal-distribution-using-r-4c2b2f64e1a3
+# testing MVN
+# if the data truly multivariate normal
+mvn(h[,1:10], mvnTest = "royston", univariatePlot = "scatter")
+mvn(h[,1:10], mvnTest = "royston", univariatePlot = "qq")
+mvn(h[,1:10], mvnTest = "royston", univariatePlot = "box")
+mvn(h[,1:10], mvnTest = "royston", univariatePlot = "histogram")
+mvn(h[,1:10], mvnTest = "royston", multivariatePlot = "scatter", 
+    multivariateOutlierMethod="quan")
+
+mvn(g[,1:10], mvnTest = "royston", univariatePlot = "scatter")
+mvn(g[,1:10], mvnTest = "royston", univariatePlot = "qq")
+mvn(g[,1:10], mvnTest = "royston", univariatePlot = "box")
+mvn(g[,1:10], mvnTest = "royston", univariatePlot = "histogram")
+mvn(g[,1:10], mvnTest = "royston", multivariatePlot = "scatter", 
+    multivariateOutlierMethod="quan")
+# drawing the relationship between the variables:
+
+corr.g <- ggcorrplot(cor(g[,1:10]), 
+         method="square",
+         title="Gamma Matrix Correlations",
+         insig="blank")
+
+corr.h <- ggcorrplot(cor(h[,1:10]), 
+         method="square",
+         title="Hadron Matrix Correlations",
+         insig="blank")
+corr.g + corr.h
+
+plot(g,
+     col = "black",
+     main = "Bivariate Normal with Confidence Intervals")
+```
+
+
+```{r}
+# starting LDA, although we expect QDA to perform better
+# the main goal is to find hyperplanes which separate he classes
+# the coordinates in the crimcoords: predict($x)
+gamma.train <- data.frame(gamma.train)
+gamma.test <- data.frame(gamma.test)
+
+gamma.lda <- lda(class ~ Length + Width + Size + Conc + Conc1 + Asym + M3Long + M3Trans +Alpha + Dist,
+                 data=data.frame(gamma.train))
+gamma.lda 
+# the prior probabilities are nearly the same for being class "h" or "g"
+# the group means are very similar, since the data is scaled
+# checking multivariate normality and covariance between predictors
+summary(gamma.lda,gamma.test)
+predict(gamma.lda,gamma.test)$class
+predict(gamma.lda,gamma.test)$x # there will be k-1, hence 1 dimension only LD1, hence can't plot in 2D
+
+predict(gamma.lda,gamma.test)$posterior
+lda.pred <- predict(gamma.lda,gamma.test)
+lda.pred$class
+
+gamma.train <- as.data.frame(gamma.train)
+gamma.test <- as.data.frame(gamma.test)
+gamma.train$class <- as.factor(gamma.train$class)
+gamma.test$class <- as.factor(gamma.test$class)
+
+task = makeClassifTask(data = gamma.train, target = "class")
+lrn = makeLearner("classif.lda", predict.type = "prob")
+mod = train(lrn, task)
+
+pred = predict(mod, newdata = gamma.test)
+#performance(pred, measures = mmce) # mean classification error: 0.21181 
+head(as.data.frame(pred))
+
+
+cm <- table(lda.pred$class, gamma.test$class)
+cm
+# test accuracy:
+misclass <- (sum(colSums(cm)) - sum(diag(cm)))/sum(colSums(cm))
+misclass # 0.2360406 on the test, similar to linear regression 0.2308725 at threshold 0.5
+accuracy <- sum(diag(cm))/sum(colSums(cm))
+accuracy # 0.78819, again similar to log. reg. 0.7691275 at threshold 0.5
+# it seems LDA performs similar to log. reg. 
+
+# constructing a ROC, AUC plot 
+actuals <- gamma.test$class == "h"
+lda.posteriors <- as.data.frame(predict(gamma.lda,gamma.test)$posterior)
+pred <- prediction(lda.posteriors[,2], gamma.test$class)
+perf.rate <- ROCR::performance(pred, measure = "tpr", x.measure = "fpr")
+perf.auc <- ROCR::performance(pred, measure = "auc")
+perf.auc@y.values # 0.8634536
+
+#perf.rate <- ROCR::performance(pred, measure = "sens", x.measure = "spec")
+
+par(pty="m",mai=c(0.5,0.8,0.2,0.5), cex.lab=1.2, cex.main=1.5) # graphical params
+plot(perf.rate, lwd=2,  box.lwd=0.01,  xaxis.lwd=2.5, yaxis.lwd=2.5,
+     avg="threshold",
+     spread.estimate="boxplot",
+     colorize = T,
+     main="ROC curve LDA"
+     )
+abline(a=0, b=1, col="grey65", lwd=2, lty=5)
+text(x=0.4, y=.6,labels= paste0('AUC = ',round(perf.auc@y.values[[1]],3)))
+
+# AUC slightly better than for log. regression
+
+roc = pROC::roc(predictor = lda.posteriors[,2],
+  response = gamma.test$class,
+  levels = c('g','h'),
+  percent = TRUE)
+
+test.posterior <- as.data.frame(cbind(predict(gamma.lda,gamma.test)$posterior[,2], gamma.test$class))
+
+roc.lda <- roc(response = gamma.test$class ,
+                 predictor= as.numeric(lda.pred[[1]]))
+auc.lda <- round(auc(roc.lda),4)
+
+roc.lda.train <- roc(response= as.vector(gamma.train$class),
+                       predictor = as.numeric(predict(gamma.lda,gamma.train)$class))
+auc.lda.train <- round(auc(roc.lda.train),4)
+
+# comparing ROC curve of train and test for QDA:
+ggroc(list(roc.lda.train, roc.lda),
+      aes=c("linetype", "colour"))+
+  scale_linetype_manual(values=c("solid","dashed"),
+                        labels=c("LDA train",
+                                 "LDA test"))+
+  scale_colour_manual(values = c("steelblue",  "red"),
+                      labels=c("LDA train",
+                                 "LDA test"))+
+  #labs(colour="")+
+  ggtitle("ROC curve LDA")+
+  theme(legend.position = "bottom")+
+  annotate("text", x = .5, y = .4, label = paste('AUC = ', round(auc.lda,3)), size=4, col="red")+
+  annotate("text", x = .5, y = .5, label = paste('AUC_train = ', round(auc.lda.train,3)), size=4, col="steelblue")
+ggsave("roc_lda.png")
+```
+
+
+
+```{r}
+# https://towardsdatascience.com/linear-discriminant-analysis-lda-101-using-r-6a97217a55a6
+gamma.pca.data <- as.data.frame(cbind(as.data.frame(predict(gamma.pca)), gamma$class))
+str(as.data.frame(predict(gamma.pca)))
+str(gamma.pca.data)
+colnames(gamma.pca.data)[11] <- "class"
+
+gamma.pca.data.train <- gamma.pca.data[index==1,]
+gamma.pca.data.test <- gamma.pca.data[index==2,]
+
+gamma.pca.lda.model <- lda(class ~ Comp.1 + Comp.2 + Comp.3 + Comp.4 + Comp.5 + Comp.6 + Comp.7 + Comp.8 +Comp.9 + Comp.10, data=gamma.pca.data.train)
+gamma.pca.lda.model
+
+gamma.pca.lda.predict <- predict(gamma.pca.lda.model, gamma.pca.data.test)
+
+# building ROC curve on the gamma.pca.data
+pca.lda.posteriors <- as.data.frame(gamma.pca.lda.predict$posterior)
+
+roc = roc(predictor = pca.lda.posteriors[,2],
+          response = gamma.test$class,
+          levels = c('g','h'),
+          percent = TRUE)
+
+
+max_sens_cutoff <- optimalCutoff(actuals=actuals, predictedScores = gamma.pca.lda.predict$posterior[,2], optimiseFor='Both')  
+
+```
+
+
+
+```{r}
+# QDA
+gamma.qda <- qda(class ~ Length + Width + Size + Conc + Conc1 + Asym + M3Long + M3Trans +Alpha + Dist, data=gamma.train, method="mle")
+
+gamma.qda.cv <- qda(class ~ Length + Width + Size + Conc + Conc1 + Asym + M3Long + M3Trans +Alpha + Dist, data=gamma.train, CV=TRUE, method="mle")
+head(gamma.qda.cv$posterior)
+
+gamma.qda.cv
+summary(gamma.qda)
+
+qda.pred <- predict(gamma.qda, gamma.test, type="response")
+
+table(qda.pred[[1]], as.factor(gamma.test$class))
+accuracy <- sum(diag(table(qda.pred[[1]], gamma.test$class)))/sum(colSums(table(qda.pred[[1]], gamma.test$class)))
+accuracy # 0.7265725
+
+# ROC curve 
+
+preds <- ROCR::prediction(predict(gamma.qda,gamma.test, type="response")$posterior[,2], gamma.test$class)
+perf.rate <- ROCR::performance(preds, "tpr", "fpr" )
+perf.auc <- ROCR::performance(preds, "auc" )
+perf.auc@y.values[[1]] #0.8799082
+
+
+par(mfrow=c(1,1))
+#par(mfrow=c(1,1),pty="m",mai=c(0.5,0.8,0.2,0.5),mar=c(1,1,1,1), cex.lab=1.2, cex.main=1.5) # graph params
+plot(perf.rate, lwd=2,  box.lwd=0.01,  xaxis.lwd=2.5, yaxis.lwd=2.5,
+     avg="threshold",
+     spread.estimate="boxplot",
+     colorize = T,
+     main="ROC curve QDA"
+     )
+abline(a=0, b=1, col="grey65", lwd=2, lty=5)
+text(x=0.4, y=.6,labels= paste0('AUC = ',round(perf.auc@y.values[[1]],4)))
+
+
+roc.qda <- roc(response = gamma.test$class ,
+                 predictor= predict(gamma.qda,gamma.test)$posterior[,2])
+auc.qda <- round(auc(roc.qda),4)
+
+roc.qda.train <- roc(response= as.numeric(gamma.train$class),
+                       predictor = predict(gamma.qda,gamma.train)$posterior[,2])
+auc.qda.train <- round(auc(roc.qda.train),4)
+
+# comparing ROC curve of train and test for QDA:
+ggroc(list(roc.qda.train, roc.qda),
+      aes=c("linetype", "colour"))+
+  scale_linetype_manual(values=c("solid","dashed"),
+                        labels=c("QDA train",
+                                 "QDA test"))+
+  scale_colour_manual(values = c("steelblue",  "red"),
+                      labels=c("QDA train",
+                                 "QDA test"))+
+  #labs(colour="")+
+  ggtitle("ROC curve QDA")+
+  theme(legend.position = "bottom")+
+  annotate("text", x = .5, y = .5, label = paste('AUC_train = ', round(auc.qda.train,3)), size=4, col="steelblue")+
+  annotate("text", x = .5, y = .4, label = paste('AUC test = ', round(auc.qda,3)), size=4, col="red")
+
+ggsave("roc_curve_qda.png")
+
+task = makeClassifTask(data = as.data.frame(gamma.train), target = "class")
+lrn = makeLearner("classif.qda", predict.type = "response")
+mod = train(lrn, task)
+r = crossval(lrn, task = task, iters=10) 
+# CV Aggregated Result: mmce.test.mean= 0.2552795
+# mean test accuracy : 0,745
+
+par(mfrow=c(1,1))
+plot(r$measures.test, main="QDA cross validation errors", xlab="CV-fold", y="error mmce")
+abline(h=r$aggr[1], col = "red")
+text(4,0.26, "mmce test mean: 0.2543478", col="red")
+
+# https://mlr-org.com/posts/2015-07-28-visualisation-of-predictions/
+# plotLearnerPrediction(learner = lrn, task = task) # visibly there is no linear decision boundary separating the two classes
+
+pred = predict(mod, newdata = as.data.frame(gamma.test))
+performance(pred, measures = mmce) # mce: 0.2028241 , lower than for LDA 0.21181 
+head(as.data.frame(pred))
+
+# misclassification: (1 - accuracy):
+misclass <- (sum(colSums(table(predict(gamma.qda, gamma.test)$class, gamma.test$class))) - sum(diag(table(predict(gamma.qda, gamma.test)$class, gamma.test$class))))/sum(colSums(table(predict(gamma.qda, gamma.test)$class, gamma.test$class)))
+misclass # 0.2747112
+
+
+qda.posteriors <- as.data.frame(predict(gamma.qda,gamma.test)$posterior)
+roc = roc(predictor = predict(gamma.qda,gamma.test)$posterior[,2],
+          response = gamma.test$class,
+          levels = c('g','h'),
+          percent = TRUE,
+          ret=TRUE)
+roc
+
+test.posterior <- as.data.frame(cbind(predict(gamma.qda,gamma.test)$posterior[,2], gamma.test$class))
+
+sens.qda <- caret::sensitivity(table(predict(gamma.qda, gamma.test)$class, gamma.test$class))
+
+spec.qda <- caret::specificity(table(predict(gamma.qda, gamma.test)$class, gamma.test$class)) # 0.5486936
+
+par(mfrow=c(1,1))
+plot.roc(roc, print.auc = TRUE, col='red') # AUC 0.865 best so far
+  abline(v=spec.qda*100,
+         h=sens.qda*100,
+         col="blue")
+text(x=0.4, y=.6,labels= "ROC curve QDA")
+```
+
+```{r include=TRUE}
+roc_qda <-readPNG("roc_qda.png")
+roc_curve_qda <-readPNG("roc_curve_qda.png")
+roc_qda
+roc_curve_qda
+```
+
+
+# Tree based models
+
+A linear regression will likely work well if the relationship between the features and response can be well approximated by a linear model. However, if a highly non-linear and complex relationship exists, a decision tree might outperform linearity. This proves to be the case for the gamma data.
+
+When fitting a tree based model, a complexity parameter plot indicates that a cp = 0.011 or lower will be optimal for pruning. A pruned tree predicts the classes on the test set with an accuracy of 0.7946085, which is the best performance up to this point.
+To exploit the potential of "wisdom of crowds" and increase the accuracy further, several trees got bagged into a Random Forest (classifying by majority vote, and many classifiers will reduce variability). We see on the error plot, that the OOB error stabilizes around 300 trees, and reaches its minimum at 185 trees. With this Random Forest we get a best test accuracy of 0.8536585 up to this point.
+
+
+```{r}
+# decision trees
+# bagging: no need for cross-validation, since due to B nr of bags, there will be B/k estimates
+# for observation "i" (; k = nr. of classes)
+
+gamma.tree <- rpart(as.factor(class) ~., data=gamma.train, method="class")
+
+tree.pred <- predict(gamma.tree, gamma.test, type="class")
+table(tree.pred, gamma.test$class)
+tree.acc <- sum(diag(table(tree.pred, gamma.test$class))) / sum(colSums(table(tree.pred, gamma.test$class)))
+tree.acc # 0.7946085 so far seems to be the highest accuracy
+
+gamma.tree1 <- rpart(as.factor(class) ~., data=gamma.train, method="class", minsplit=2, cp=0.03, xval=10, maxdepth=7)
+# png("tree.png")
+# rpart.plot(gamma.tree)
+# dev.off()
+# png("tree1.png")
+# rpart.plot(gamma.tree1)
+# dev.off()
+
+plotcp(gamma.tree, main="Complexity parameter (cp)") # plots the complexity parameter table
+#plotcp plots the relative cross-validation error for each sub-tree from smallest to largest to let you compare the risk for each complexity parameter β.
+printcp(gamma.tree)
+summary(gamma.tree)
+plotcp(gamma.tree1)
+printcp(gamma.tree1)
+#rpart.plot(gamma.tree1, box.palette="RdBu", shadow.col="gray", nn=TRUE)
+tree.pred1 <- predict(gamma.tree1, gamma.test, type="class")
+table(tree.pred1, gamma.test$class)
+tree.acc1 <- sum(diag(table(tree.pred1, gamma.test$class))) / sum(colSums(table(tree.pred1, gamma.test$class)))
+tree.acc1 # 0.7676508
+
+
+gamma.tree1$splits
+roc.tree1 <- pROC::roc(response = testdata$class ,
+                 predictor= as.numeric(tree.pred1))
+auc.tree1 <- round(auc(roc.tree1),4)
+
+roc.tree1.train <- pROC::roc(response= as.vector(traindata$class),
+                       predictor = as.numeric(predict(gamma.tree1,type="class")))
+auc.tree1.train <- round(auc(roc.tree1.train),4)
+
+set.seed(17)
+library(tree)
+#tree.tree <- tree(class ~., gamma.train)
+#cv.gamma <- cv.tree(tree.tree, FUN = prune.tree, K =10) # pruned by optimum misclass rate
+#names(cv.gamma)
+#cv.gamma # size (terminal node) 10 or 11 is the lowest cross val. error
+
+# plotting the error rate as a function of size and complexity param:
+png("tree_valerror.png")
+par(mfrow=c(1,2))
+plot(cv.gamma$size, cv.gamma$dev, type="b", main="error decr as size increases")
+# cross val error decreases, min at about size 10, 11
+plot(cv.gamma$k, cv.gamma$dev, type="b", main="val error incr. with complexity") #
+cross val error increases with complexity, approx. exponentially after k=50
+#k: complexity parameter
+#dev.off()
+
+# we are pruning and estimating test error with the best tree, size = 10 or 11
+#prune.tree <- prune.misclass(gamma.tree, best=10)
+prune.tree <- prune.rpart(gamma.tree, best=10, cp=0.0015,method= "misclass", split="gini")
+#plot(prune.tree)
+#rpart.plot(prune.tree)
+#text(prune.tree, pretty=5) # alpha is the most important feature
+
+# complexity plot
+# printcp(prune.tree)
+# png("cp_tree.png")
+# plotcp(prune.tree)
+# dev.off()
+
+# predicting on the test set with the pruned tree:
+prune.predict <- predict(prune.tree, gamma.test, type="class")
+table(prune.predict, gamma.test$class)
+tree.acc <- sum(diag(table(prune.predict, gamma.test$class))) / sum(colSums(table(prune.predict, gamma.test$class)))
+tree.acc # 0.7946085 test accuracy -  improvement vs the non-validated 
+
+roc.prune <- pROC::roc(response = gamma.test$class ,
+                 predictor= as.numeric(prune.predict))
+auc.prune <- round(auc(roc.prune),4)
+
+roc.prune.train <- pROC::roc(response= as.vector(gamma.train$class),
+                       predictor = as.numeric(predict(prune.tree,type="class")))
+auc.prune.train <- round(auc(roc.prune.train),4)
+
+# comparing ROC curve of the trees : 
+ggroc(list(roc.prune.train, roc.prune),
+      aes=c("linetype", "colour"))+
+  scale_linetype_manual(values=c("solid","dashed"))+#,
+                        #labels=c("Tree train",
+                                 #"Tree test", "Pruned tree train", "Pruned tree test")
+  scale_colour_manual(values = c("steelblue", "red"),
+                      labels=c("Tree train","Tree test"))+
+  labs(colour="", value="")+
+  ggtitle("ROC Pruned Tree")+
+  theme(legend.position = "bottom")+
+  annotate("text", x = .5, y = .3, label = paste('AUC_train = ', round(auc.prune.train,3)), size=4, col="steelblue")+
+  annotate("text", x = .5, y = .2, label = paste('AUC = ', round(auc.prune,3)), size=4, col="red")
+ggsave("roc_curves_tree.png")
+```
+
+
+
+```{r}
+# Random Forest : special form of Bagging
+bag.gamma <- randomForest(gamma.test[,1:10], as.factor(gamma.test$class), prox=TRUE, mrty=5, ntree=1000) # mrty control the nr of variables in each randomly designed tree
+bag.gamma # OOB error rate: 15% : no cross-validation needed further
+#OOB is the cross validation regime
+par(mfrow=c(1,1))
+#------------------------------optimizing mrty and ntree combinations.
+#png("bag_error.png")
+plot(bag.gamma, main="Error vs nr of trees")
+legend(600, 0.26, 
+       col=c("black","green", "red"),lty=1:2, cex=0.8,
+       legend=c("error g", "OOB", "error h"))
+text(x=145, y=0.16, labels="x", pos=4, col="blue")
+# error stabilizes after about 500-600 trees
+# the 3 lines are:  error of g, OOB,  error of h
+#dev.off()
+eval <- as.data.frame(bag.gamma$err.rate)
+eval
+eval[which.min(eval$OOB),]# OOB reaches its min at 185 trees
+best.oob <- as.numeric(rownames(eval[which.min(eval$OOB),]))
+bag.gamma <- randomForest(gamma.train[,1:10], as.factor(gamma.train$class), prox=TRUE, mrty=5, ntree=best.oob) # with mrty=5 we don't need cross-validation, since 
+# averaging uncorrelated quantities results in more reduced variance between the trees. and trees become also more decorrelated.
+
+par(mfrow=c(1,1))
+plot(gamma.train[[1]], gamma.train[[6]], pch=21, xlab=names(gamma.train)[1],
+     ylab=names(gamma.train)[6],
+     bg=c("red", "blue")[as.numeric(factor(gamma.train$class))],
+     main="xyz")
+points(gamma.train[[1]], gamma.train[[6]], pch=21, cex=2, bg=c("red", "blue"))
+
+random.pred <- predict(bag.gamma, gamma.test)
+table(random.pred, gamma.test$class)
+random.acc <- sum(diag(table(random.pred, gamma.test$class))) / sum(colSums(table(random.pred, gamma.test$class)))
+random.acc # 0.8536585 test accuracy - wow! one of best performance up to now!
+
+# ROC curve:
+roc.rf <- roc(response = gamma.test$class , predictor= as.numeric(random.pred))
+auc.rf <- round(auc(roc.rf),4)
+
+roc.rf.train <- roc(response= gamma.train$class, predictor = as.numeric(predict(bag.gamma, type="class")))
+auc.rf.train <- round(auc(roc.rf.train),4)
+
+# comparing train and test ROC curves of xgboost with best ntrees:
+ggroc(list(roc.rf, roc.rf.train))+
+  scale_colour_manual(values = c("red", "steelblue"),
+                      labels=c("RF test",
+                                 "RF train"))+
+  labs(colour="")+
+  ggtitle("ROC Random Forest")+
+  theme(legend.position = "bottom")+
+  annotate("text", x = .5, y = .40, label = paste('AUC train = ', round(auc.rf.train,3)), size=4, col="steelblue")+
+  annotate("text", x = .5, y = .5, label = paste('AUC test = ', round(auc.rf,3)), size=4, col="red")
+#ggsave("roc_curve_RF.png")
+```
+
+Boosting is a very performant method, which often improves ensemble methods even further. It uses many trees which are not independent from each other, but rather formed sequentially and learn from each other. The test maximum AUC value is reached at 42 trees, and the test logloss mean value reaches its minimum at 18 trees, which got plugged in as parameter "nrounds" into the xboost model. By exploiting this machine learning algorithm, we manage to increase the test prediction rate to 0.8408216 with an AUC of 0.912. By reducing the learning rate parameter "eta" from 0.3 to 0.01, we further increase the accuracy to 0.8523748 and AUC 0.931.
+Thus far Random Forest and the Xboost method with a slow-learning rate have the best performance with an accuracy of about 0.852-0.854.
+
+```{r}
+# boosting: each tree is grown using information from previously grown trees
+set.seed(17)
+gamma.train <- gamma.train%>%dplyr::mutate(class=fct_recode(as.factor(class),"0" ="g","1"="h"))
+gamma.test <- gamma.test%>%dplyr::mutate(class=fct_recode(as.factor(class),"0" ="g","1"="h"))
+
+gamma.train <- sapply(gamma.train[,1:11], as.numeric)
+gamma.test <- sapply(gamma.test[,1:11], as.numeric)
+
+gamma.boost <- xgb.cv(data=gamma.train[,1:10],
+                    label= gamma.train[,11]-1,
+                    objective = "binary:logistic",
+                    nrounds=100,
+                    nfold=5, # nrounds
+                    eta = 0.3, # the lower the rate, the less risk to overfit
+                    depth=6, # lower values avoid over-fitting
+                    metrics=c("auc", "logloss", "error"),
+                    prediction = T,
+                    verbose = 0)
+
+eval <- as.data.frame(gamma.boost$evaluation_log)
+nrounds.mean.best <- which.min(eval$test_logloss_mean) # 18 trees
+nrounds.mean.best.train <- which.min(eval$train_logloss_mean) # 100 trees
+nrounds.sd.best <- which.min(eval$test_logloss_std) # 1 tree
+nrounds.test.error<- which.min(eval$test_error_mean) # 37 trees
+ nrounds.mean.auc.best <- which.max(eval$test_auc_mean) # 42 trees for max AUC
+
+mark.x <- nrounds.mean.best
+mark.y <- eval%>%filter(iter==nrounds.mean.best)%>%dplyr::select(test_logloss_mean)
+
+test.logloss <- ggplot(eval, aes(x=iter, y=test_logloss_mean))+
+geom_line()+
+  labs(x="nr of trees")+
+  ggtitle("Test logloss mean curve Boosting")+
+  annotate("point", x= as.numeric(mark.x) , y= as.numeric(mark.y),
+           colour="red", size=2)
+
+mark.x <- nrounds.mean.best.train
+mark.y <- eval%>%filter(iter==nrounds.mean.bes.train)%>%dplyr::select(test_logloss_mean)
+
+train.logloss <- ggplot(eval, aes(x=iter, y=train_logloss_mean))+
+geom_line()+
+  labs(x="nr of trees")+
+  ggtitle("Train logloss mean curve Boosting")+
+  annotate("point", x= as.numeric(mark.x) , y= as.numeric(mark.y),
+           colour="red", size=2)
+# ggsave("train_logloss_xgb_mean.png")
+# dev.off()
+
+ggplot(eval, aes(x=iter, y=train_logloss_std))+
+geom_line()+
+  labs(x="nr of trees")
+
+
+gamma.boost <-  xgboost::xgboost(data=gamma.train[,1:10],
+                    label= gamma.train[,11]-1,
+                    objective = "binary:logistic",
+                    nrounds=nrounds.mean.best,# nrounds: 18 the number of trees
+                    eta = 0.3,
+                    max_depth = 3,  # lower values avoid overfitting
+                    verbose = 0)
+
+gamma.boost$call
+gamma.boost$evaluation_log
+print(gamma.boost, verbose=1)  
+summary(gamma.boost)
+
+boost.pred <- predict(gamma.boost, as.matrix(gamma.test[,1:10]))
+table(round(boost.pred), gamma.test[,11]-1)
+boost.acc <- sum(diag(table(round(boost.pred), gamma.test[,11]-1))) / sum(colSums(table(round(boost.pred), gamma.test[,11]-1)))
+boost.acc # test accuracy 0.8408216- somewhat lower than random forest 85.62
+
+iteration = which.max(gamma.boost$evaluation_log$test_auc_mean) # 26 trees for best auc
+best.iter = gamma.boost$evaluation_log$iter[iteration]
+
+roc.boost <- pROC::roc(response = data.frame(gamma.test)$class , predictor= as.vector(boost.pred))
+auc.boost <- round(auc(roc.boost),4)
+
+roc.boost.train <- roc(response= data.frame(gamma.train)$class, predictor = as.numeric(predict(gamma.boost, as.matrix(gamma.train[,1:10]))))
+auc.boost.train <- round(auc(roc.boost.train),4)
+
+# comparing train and test ROC curves of xgboost with best ntrees:
+ggroc(list(roc.boost, roc.boost.train))+
+  scale_colour_manual(values = c("red", "steelblue"),
+                      labels=c("Xboost test",
+                                 "Xboost train"))+
+  labs(colour="")+
+  ggtitle("ROC Xboost")+
+  theme(legend.position = "bottom")+
+  annotate("text", x = .5, y = .5, label = paste('AUC test= ', round(auc.boost,3)), size=4, col="red")+
+  annotate("text", x = .5, y = .40, label = paste('AUC train= ', round(auc.boost.train,3)), size=4, col="steelblue")
+
+#ggsave("roc_curve_xboost.png")
+# dev.off()
+# the model is quite an overfit compared to performance on the training data
+#---------------------------------------------------------
+# we want rather small trees, but more of them (slow learning)
+
+gamma.boost.slow <- xgb.cv(data=gamma.train[,1:10],
+                    label= gamma.train[,11]-1,
+                    max_depth = 3,
+                    objective = "binary:logistic",
+                    nrounds=500, #nrounds: the number of trees
+                    eta=0.01,
+                    nfold=10,
+                    subsample=0.5, # to counter overfitting
+                    lambda = 1.5,
+                    verbose = 0)
+
+eval <- as.data.frame(gamma.boost.slow$evaluation_log)
+nrounds.mean.slow <- which.min(eval$test_logloss_mean) #500 trees
+nrounds.sd.slow <- which.min(eval$test_logloss_std) # 1 tree
+
+ggplot(eval, aes(x=iter, y=test_logloss_mean))+
+geom_line()+
+  labs(x="nr of trees")+
+  ggtitle("Xboost Test logloss mean curve")
+# ggsave("test_logloss_slowxgb_mean.png")
+# dev.off()
+
+ggplot(eval, aes(x=iter, y=test_logloss_std))+
+geom_line()+
+  labs(x="nr of trees")
+# ggsave("test_logloss_slowxgb_std.png")
+# dev.off()
+
+ggplot(eval, aes(x=iter, y=train_logloss_mean))+
+geom_line()+
+  labs(x="nr of trees")+
+  ggtitle("Train logloss mean curve")
+# ggsave("train_logloss_slowxgb_mean.png")
+# dev.off()
+
+ggplot(eval, aes(x=iter, y=train_logloss_std))+
+geom_line()+
+  labs(x="nr of trees")
+# ggsave("train_logloss_slowxgb_std.png")
+# dev.off()
+
+gamma.boost.slow <- xgboost::xgboost(data=gamma.train[,1:10], 
+                    label= gamma.train[,11]-1,
+                    max_depth = 8, # default is 6, risk of overfitting!!!
+                    objective = "binary:logistic",
+                    nrounds=500,
+                    eta=0.01, # the learning param/ shrinkage controls learning speed
+                    subsample=0.5, # to counter overfitting
+                    lambda = 0.8,
+                    refresh_leaf=0,
+                    verbose = 2)
+
+boost.slow.pred <- predict(gamma.boost.slow, as.matrix(gamma.test[,1:10]))
+table(round(boost.slow.pred), gamma.test[,11]-1)
+boost.slow.acc <- sum(diag(table(round(boost.slow.pred), gamma.test[,11]-1))) / sum(colSums(table(round(boost.slow.pred), gamma.test[,11]-1)))
+boost.slow.acc # 0.8587933 
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! best accuracy so far!
+# ROC curves 
+preds <- ROCR::prediction(boost.slow.pred, gamma.test[,11]-1)
+perf.rate <- ROCR::performance(preds, "tpr", "fpr")
+perf.auc <- ROCR::performance(preds, "auc" )
+perf.auc@y.values[[1]] # 0.9311894 on test set!
+
+par(mfrow=c(1,1))
+par(pty="m",mai=c(0.5,0.8,0.2,0.5), cex.lab=1.2, cex.main=1.5) 
+#png("roc_curve_xboost_color.png")
+plot(perf.rate, lwd=2,  box.lwd=0.01,  xaxis.lwd=2.5, yaxis.lwd=2.5,
+     avg="threshold",
+     spread.estimate="boxplot",
+     colorize = T,
+     main="ROC curve Xboost"
+     )
+abline(a=0, b=1, col="grey65", lwd=2, lty=5)
+text(x=0.4, y=.6,labels= paste0('AUC = ',round(perf.auc@y.values[[1]],3)))
+#dev.off()
+
+# roc.svm <- roc(response = gamma.test[,11]-1 , predictor= as.numeric(boost.pred))
+# plot(roc.svm,add=TRUE,colorize = TRUE, print.auc=TRUE, print.auc.x = 0.5, print.auc.y = 0.3)
+# legend(0.3, 0.2, legend = c("test-svm"), lty = c(1), col = c("blue"))
+```
+
+
+
+# Support vector machines (SVM)
+
+SVM accommodate non-linear boundaries and find hyperplanes that separate the data well. A non-linear "radial" kernel got instantiated, which acts locally on observation level (like each observation Gaussian), and measures the interaction between two data points.
+After inserting a list of parameter ranges, the optimum cost, as well as gamma values were calculated. We compare two models (one with the best parameters, and another with random values) with radial kernel and get a best model accuracy of 0.8446727, with an AUC 0.85. By plotting some of the decision boundaries in a two-dimensional space, we get a good insight about the complexity of the task, since the two classes virtually overlap in several aspects. This explains the relatively high cost parameter needed to accommodate the data, and allow for boundary violations, while controlling over-fitting through other parameters (gamma). This explains that a cost of 100.000 results in a even higher accuracy of 0.8498074.
+
+```{r}
+# SVM accomodates non-linear boundaries
+# classification with non-linear decision boundaries
+# finding  hyperplane that separates the data 
+# svm, non-linear kernel with CV default 10-fold:
+gama.train <- gamma.train.copy
+gamma.test <- gamma.test.copy
+#View(gamma.train)
+traindata <- data.frame(x= data.frame(gamma.train)[,1:10], class=as.factor(data.frame(gamma.train)$class))
+colnames(traindata) <- list("Length", "Width", "Size","Conc", "Conc1", "Asym", "M3Long","M3Trans" ,"Alpha","Dist","class")
+#traindata<-traindata%>%mutate(y=fct_recode(as.factor(y),"1" ="g","2"="h"))
+
+
+testdata<-data.frame(x= data.frame(gamma.test)[,1:10], class=as.factor(data.frame(gamma.test)$class))
+colnames(testdata) <- list("Length", "Width", "Size","Conc", "Conc1", "Asym", "M3Long","M3Trans" ,"Alpha","Dist","class")
+#testdata<-testdata%>%mutate(y=fct_recode(as.factor(y),"-1" ="g","1"="h"))
+
+# tune.out <- tune.svm( class , traindata[,1:10], kernel="radial",
+#                  ranges=list(cost=c(0.1,10,100, 1000),
+#                              gamma=c(0.005,0.05, 1,5)))
+
+best <- best.svm(x=traindata[,1:10], y=traindata$class, tunecontrol=tune.control(cross=5),cost=c(0.1,10,100, 1000), gamma=c(0.005,0.05, 1,5))
+
+summary(best)
+best$decision.values
+best$kernel # kernel =2
+best$cost # cost = 1000
+best$gamma #gamma = 0.005
+best$coef0 # coef 0 default
+best$epsilon #0.1 default
+
+summary(tune.out) #cost 100, gamma 2, CV 10-fold, best performance: 0.08208333 
+table(true=test$y, pred = predict(tune.out$best.model, newdata=test))
+
+svm.nonlinear <- svm( class ~., data=traindata,
+                      kernel="radial",
+                        cost=10, # cost is a budget, how many boundary violations allowed
+                        gamma=0.05) # gamma controls how quickly the Gaussians die away
+
+
+par(mfrow=c(1,1))
+plot(svm.nonlinear, traindata, Size ~ Conc)
+legend(-2,-1,c("1:g", "2:h"))
+plot(svm.nonlinear, traindata, M3Trans ~ Alpha)
+plot(svm.nonlinear, traindata, Size ~Dist)
+legend(1,-1,c("1:g", "2:h"))
+
+# higher cost: more violations: higher  bias, lower variance
+# lower cost: higher variance, lower bias, as there will be fewer boundary violations
+
+svm.nonlinear1 <- svm( class ~., data=traindata, # lower performance than svm.nonlinear
+                      kernel="radial",
+                        cost=1000,
+                        gamma=0.005)
+         
+svm.nonlinear <- svm( class ~., data=traindata, # lower performance than svm.nonlinear
+                      kernel="radial",
+                        cost=100000,
+                        gamma=0.005)
+summary(svm.nonlinear) # best model: at cost=10, gamma=0.05, 1262 support vectors
+# test prediction on cost=10, gamma=0.05:  0. 8446727
+
+svm.pred <- predict(svm.nonlinear, testdata)
+table(testdata$class, svm.pred)
+svm.acc<- sum(diag(table(testdata$class, svm.pred))) /sum(colSums(table(testdata$class, svm.pred)))
+svm.acc # 0.8446727 test accuracy, accurate CV estimation of error ~ 0.15
+
+# ROC curve
+
+preds <- ROCR::prediction(as.numeric(svm.pred), testdata$class)
+perf.rate <- ROCR::performance(preds, "tpr", "fpr")
+perf.auc <- ROCR::performance(preds, "auc" )
+perf.auc@y.values[[1]] # 0.8496065 AUC slightly below Xboost
+
+#png("roc_curve_svm.png")
+par(pty="m",mai=c(0.5,0.8,0.2,0.5), cex.lab=1.2, cex.main=1.5) 
+plot(perf.rate, lwd=2,  box.lwd=0.01,  xaxis.lwd=2.5, yaxis.lwd=2.5,
+     avg="threshold",
+     spread.estimate="boxplot",
+     colorize = T,
+     main="ROC curve SVM"
+     )
+abline(a=0, b=1, col="grey65", lwd=2, lty=5)
+text(x=0.4, y=.6,labels= paste0('AUC = ',round(perf.auc@y.values[[1]],3)))
+#dev.off()
+perf <- ROCR::performance(preds, "sens", "spec")
+
+#plot(perf, colorize=TRUE)
+#png("roc_sens_spec_svm.png")
+plot(perf, lwd=2,  box.lwd=0.01,  xaxis.lwd=2.5, yaxis.lwd=2.5,
+     avg="threshold",
+     spread.estimate="boxplot",
+     colorize = T,
+     main="Sens. vs Spec. SVM"
+     )
+abline(a=1, b=-1, col="grey65", lwd=2, lty=5)
+text(x=0.4, y=.2,labels= paste0('AUC = ',round(perf.auc@y.values[[1]],3)))
+#dev.off()
+#--------------------------------------
+# performance of svm.nonlinear1
+
+summary(svm.nonlinear1) 
+# test prediction on cost=10000, gamma=0.005: 0.8356868 lower than svm.nonlinear
+# the larger the cost, the narrower the marin: model will overfit, perform well on the training, but less well on test data
+
+svm.pred1 <- predict(svm.nonlinear1, testdata)
+table(testdata$class, svm.pred1)
+svm.acc<- sum(diag(table(testdata$class, svm.pred1))) /sum(colSums(table(testdata$class, svm.pred1)))
+svm.acc # 0.8356868 test accuracy
+
+# ROC curve
+
+pred1 <- ROCR::prediction(as.numeric(svm.pred1), testdata$class)
+perf1 <- ROCR::performance(pred1, "tpr", "fpr")
+perf1.auc <- ROCR::performance(pred1, "auc")
+perf1.auc@y.values[[1]] # 0.840875
+plot(perf1, colorize=TRUE)
+
+perf1 <- performance(pred1, "sens", "spec")
+plot(perf1, colorize=TRUE)
+
+
+roc.svm <- roc(response = testdata$class , predictor= as.numeric(svm.pred))
+auc.svm <- round(auc(roc.svm),4)
+
+roc.svm1 <- roc(response = testdata$class , predictor= as.numeric(svm.pred1))
+auc.svm1 <- round(auc(roc.svm1),4)
+
+#legend(0.3, 0.2, legend = c("test-svm"), lty = c(1), col = c("blue"))
+# AUC 0.841 on test
+roc.svm.train <- roc(response = traindata$class , predictor= as.numeric(svm.nonlinear$fitted))
+auc.svm.train <- round(auc(roc.svm.train),4)
+
+roc.svm1.train <- roc(response = traindata$class , predictor= as.numeric(svm.nonlinear1$fitted))
+auc.svm1.train <- round(auc(roc.svm1.train),4)
+
+# AUC 0.8619 slightly over-performs on training set
+
+# plot SVM1_cost:1000, gamma:0.005
+svm1 <- ggroc(list(roc.svm1.train, roc.svm1))+
+  scale_colour_manual(values = c("red", "steelblue"),
+                      labels=c("train", 
+                                 "test"))+
+  labs(colour="")+
+  ggtitle("cost:1000,gam:.005")+
+  theme(legend.position = "bottom")+
+  annotate("text", x = .5, y = .5, label = paste('AUC train = ', round(auc.svm1.train,3)), size=4, col="steelblue")+
+  annotate("text", x = .5, y = .40, label = paste('AUC test = ', round(auc.svm1,3)), size=4, col="red")
+
+
+svm <- ggroc(list(roc.svm.train, roc.svm))+
+  scale_colour_manual(values = c("red", "steelblue"),
+                      labels=c("train", 
+                                 "test"))+
+  labs(colour="")+
+  ggtitle("SVM_cost:10,gam:.05")+
+  theme(legend.position = "bottom")+
+  annotate("text", x = .5, y = .5, label = paste('AUC train= ', round(auc.svm.train,3)), size=4, col="steelblue")+
+  annotate("text", x = .5, y = .40, label = paste('AUC test = ', round(auc.svm,3)), size=4, col="red")
+
+svm + svm1
+#ggsave("roc_comparison_svm.png")
+#dev.off()
+```
+
+# Neural Networks (NN)
+
+When fitting a network with no hidden layer, "rmsprop" optimizer, softmax activation and 10, 30 and 50 epochs, the best test accuracy is 0.843389, which is the second largest after Random Forest and Xboost. Even by adding an additional hidden layer or changing the optimizer to adam, the performance is not increasing.
+
+```{r}
+#setwd("C:/Users/steff/Desktop/Sheffield_Studies/MSc/MAS61007_ML/Exercises_Ass/Ass2/")
+# omitting NA data from the set, and loading the data
+gamma <- na.omit(read_csv("data/gamma.csv")) 
+gamma.proba <- na.omit(read_csv("data/gamma_test.csv"))
+
+# Scaling the data
+gamma <- gamma%>%mutate_at(c(colnames(gamma[,1:10])), ~(scale(.) %>% as.vector))
+apply(gamma[,3:10],2,sd) # st.dev check after scaling
+apply(gamma[,3:10],2,mean) # mean check after scaling
+gamma <-gamma%>%mutate(class=fct_recode(as.factor(class),"1" ="g","2"="h"))
+gamma$class <- as.numeric(gamma$class) # all numerical values
+glimpse(gamma) # check if all numerical
+attach(gamma)
+
+library(DT)
+datatable(gamma[sample(nrow(gamma), replace=F, size=0.01 * nrow(gamma)),]) # html format table
+
+# data preprocessing, transforming into a tensor
+gamma <- as.matrix(gamma)
+dimnames(gamma) = NULL # discarding the col names
+
+
+# splitting into training and test set
+set.seed(17)
+index <- sample(2,nrow(gamma),replace=TRUE, prob=c(0.8,0.2))
+gamma.train <- gamma[index==1,]
+gamma.test <- gamma[index==2,]
+
+X_train <- gamma[index == 1, 1:10]
+X_test <- gamma[index==2 , 1:10]
+
+# one-hot-encoding for the target:
+y_train <- keras::to_categorical(gamma[index==1, 11])
+y_test <- keras::to_categorical(gamma[index==2, 11])
+
+y_train <- y_train[,2:3]
+y_test <- y_test[,2:3]
+# cbind(y_test_actual[1:10], y_test[1:10,])
+```
+
+
+```{r}
+# fcreating the NN model:
+remove(modelnn)
+modelnn <- keras_model_sequential() # setting up the model as a sequence of layers
+
+modelnn %>%
+  layer_dense(name="InputLayer", 
+              units= 10, 
+              activation="relu", 
+              input_shape = c(10)) %>% # 10 input feedings (10 explanatory variables) into the first layer
+  layer_dense(name="OutputLayer",
+              units= 2, 
+              activation="softmax") # sigmoid: final output binary: gamma or hadron
+summary(modelnn) # 132 parameters
+
+# optimizer rmsprop works for classification
+# cross-entropy is our measure for the loss-function
+# compiling the network:
+modelnn %>% compile(
+  loss="categorical_crossentropy",
+  optimizer="rmsprop", #optional : adam
+  metrics=c("accuracy")
+)
+
+# feeding the data and fitting the network:
+history<- modelnn %>% fit(X_train, 
+                          y_train, 
+                          epoch = 50,  
+                          batch_size = 128, 
+                          validation_split = 0.1, 
+                          verbose = 2)
+plot(history , main="NN 50 epochs")
+par(mfrow=c(1,2))
+plot(history$metrics$acc, main="NN training accuracy", xlab="Epochs", ylab="Accuracy", col="red", type="l")
+plot(history$metrics$loss, main="NN training loss", xlab="Epochs", ylab="Loss", col="blue", type="l")
+
+
+#performance on the test data:
+nn_pred <- modelnn%>%predict(X_test)
+y_pred <- modelnn %>% predict(X_test) %>% k_argmax()
+y_pred <- as.array(y_pred)
+predict_classes(modelnn, X_test)
+
+modelnn %>% evaluate(X_test, y_test) # 0.8433890
+
+# adding another hidden layer
+remove(modelnn)
+
+modelnn <- keras_model_sequential() # setting up the model as a sequence of layers
+
+modelnn %>%
+  layer_dense(name="InputLayer", 
+              units= 10, 
+              activation="relu", 
+              input_shape = c(10)) %>% # 10 input feedings (10 explanatory variables) into the first layer
+  layer_dense(name="HiddenLayer",
+              units= 10, 
+              activation="relu") %>%
+  layer_dense(name="OutputLayer",
+              units=2,
+              activation="softmax")
+summary(modelnn) # 242 parameters
+
+modelnn %>% compile(
+  loss="categorical_crossentropy",
+  optimizer="rmsprop", #optional : adam
+  metrics=c("accuracy")
+)
+
+history<- modelnn %>% fit(X_train, 
+                          y_train, 
+                          epoch = 50,  
+                          batch_size = 128, 
+                          validation_split = 0.1, 
+                          verbose = 2)
+
+nn_pred <- modelnn%>%predict(X_test)
+y_pred <- modelnn %>% predict(X_test) %>% k_argmax()
+y_pred <- as.array(y_pred)
+predict_classes(modelnn, X_test)
+
+modelnn %>% evaluate(X_test, y_test) # 0.8202824: adding a hidden layer brings no improvment in terms of accuracy
+
+
+#-------------------------
+# optimizer adam
+
+remove(modelnn)
+
+modelnn <- keras_model_sequential() # setting up the model as a sequence of layers
+
+modelnn %>%
+  layer_dense(name="InputLayer", 
+              units= 10, 
+              activation="relu", 
+              input_shape = c(10)) %>% # 10 input feedings (10 explanatory variables) into the first layer
+  layer_dense(name="OutputLayer",
+              units=2,
+              activation="sigmoid")
+summary(modelnn) # 242 parameters
+
+modelnn %>% compile(
+  loss="categorical_crossentropy",
+  optimizer="rmsprop", #optional : adam
+  metrics=c("accuracy")
+)
+
+history<- modelnn %>% fit(X_train, 
+                          y_train, 
+                          epoch = 50,  
+                          batch_size = 128, 
+                          validation_split = 0.1, 
+                          verbose = 2)
+
+nn_pred <- modelnn%>%predict(X_test)
+y_pred <- modelnn %>% predict(X_test) %>% k_argmax()
+y_pred <- as.array(y_pred)
+predict_classes(modelnn, X_test)
+
+modelnn %>% evaluate(X_test, y_test)
+# with sigmoid activation: accuracy 0.7958922 
+```
+
+# Conclusion
+
+Andre Ye describes in his post (https://towardsdatascience.com/when-and-why-tree-based-models-often-outperform-neural-networks-ceba9ecd0fd8) that tree based models are basically simplified neural networks, modelling by a deterministic approach (following certain yes/no-rules, just like human thinking) instead of a probabilistic technique. Neural networks work well on data with massive scale, such as text or images. But for our binary classification at hand, a downscaled tree based method will outperform a such complex network. Logistic Regression and LDA slightly outperformed QDA, since the differences in the covariance matrices were not significant enough to justify more flexibility by QDA. However, when looking at classification plots and the improving results of tree based models or SVM, we can convince ourselves that quadratic methods ware needed for this data set.
+
+In summary, we conclude that either a Random Forest or a slow-learner Xboost model will perform best on unseen gamma data, with an accuracy of about 0.852 - 0.855.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
